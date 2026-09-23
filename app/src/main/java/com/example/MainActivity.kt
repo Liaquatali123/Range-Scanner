@@ -15,6 +15,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -577,6 +578,29 @@ fun ScanHistoryTab(
     val historyList by viewModel.historyList.collectAsStateWithLifecycle()
     val dateFormat = remember { SimpleDateFormat("MMM dd, yyyy HH:mm:ss", Locale.getDefault()) }
 
+    // Lazy load pagination state
+    val listState = rememberLazyListState()
+
+    // Reset limit to 10 on tab entry
+    LaunchedEffect(Unit) {
+        viewModel.resetHistoryLimit()
+    }
+
+    // Load more when scrolled near the end
+    val shouldLoadMore = remember {
+        derivedStateOf {
+            val totalItemsCount = listState.layoutInfo.totalItemsCount
+            val lastVisibleItemIndex = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: 0
+            lastVisibleItemIndex >= totalItemsCount - 2 && totalItemsCount > 0
+        }
+    }
+
+    LaunchedEffect(shouldLoadMore.value) {
+        if (shouldLoadMore.value) {
+            viewModel.loadMoreHistory()
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -639,6 +663,7 @@ fun ScanHistoryTab(
             }
         } else {
             LazyColumn(
+                state = listState,
                 modifier = Modifier
                     .fillMaxWidth()
                     .weight(1f)

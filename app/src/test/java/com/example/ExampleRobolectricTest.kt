@@ -81,10 +81,11 @@ class ExampleRobolectricTest {
 
     @Test
     fun testOversizedCidrRange() {
-        // Safety limit is 65,536 hosts. A /15 range is 131,072 hosts -> Should throw
-        assertThrows(IllegalArgumentException::class.java) {
-            scanEngine.expandCidr("10.0.0.0/15")
-        }
+        // Since we removed all limitations to allow full unlimited CIDR scans,
+        // expanding a /15 range should succeed and yield the expected host list count.
+        val ips = scanEngine.expandCidr("10.0.0.0/15")
+        // A /15 subnet has 131,072 total addresses. Excluding network and broadcast: 131,070 hosts
+        assertEquals(131070, ips.size)
     }
 
     @Test

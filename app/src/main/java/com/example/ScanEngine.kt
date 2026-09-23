@@ -134,10 +134,6 @@ class ScanEngine(private val context: Context) {
 
         val totalHosts = broadcast - network + 1
 
-        if (totalHosts > maxTargetLimit) {
-            throw IllegalArgumentException("This range contains too many targets ($totalHosts). Reduce the CIDR range before scanning.")
-        }
-
         val list = mutableListOf<String>()
         when {
             prefix == 32 -> {
@@ -348,20 +344,22 @@ class ScanEngine(private val context: Context) {
             val endTime = Date()
             val durationMs = endTime.time - startTime.time
 
-            // Write final scan log
-            writeScanLog(
-                scanDir = scanDir,
-                scanNumber = scanNumber,
-                cidr = cidr,
-                portsInput = portsInput,
-                startTimeStr = df.format(startTime),
-                endTimeStr = df.format(endTime),
-                durationMs = durationMs,
-                totalTargets = totalTargets,
-                completedTargets = completedCount,
-                liveHosts = liveHostsCount,
-                stopped = isStopped
-            )
+            // Write final scan log asynchronously to prevent UI freeze or blocking on completion
+            CoroutineScope(Dispatchers.IO).launch {
+                writeScanLog(
+                    scanDir = scanDir,
+                    scanNumber = scanNumber,
+                    cidr = cidr,
+                    portsInput = portsInput,
+                    startTimeStr = df.format(startTime),
+                    endTimeStr = df.format(endTime),
+                    durationMs = durationMs,
+                    totalTargets = totalTargets,
+                    completedTargets = completedCount,
+                    liveHosts = liveHostsCount,
+                    stopped = isStopped
+                )
+            }
 
             withContext(Dispatchers.Main) {
                 if (isStopped) {
@@ -468,9 +466,11 @@ class ScanEngine(private val context: Context) {
                 statusBreakdown[result.statusCode] = (statusBreakdown[result.statusCode] ?: 0) + 1
             }
 
-            // Save to status code file (e.g. 200.txt) if it is considered live
+            // Save to status code file (e.g. 200.txt) if it is considered live (asynchronously off-thread)
             if (result.isLive) {
-                writeResultToFile(scanDir, result)
+                CoroutineScope(Dispatchers.IO).launch {
+                    writeResultToFile(scanDir, result)
+                }
                 return true
             }
         } else {

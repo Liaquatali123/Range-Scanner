@@ -49,13 +49,28 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
     private val _errorMessage = MutableStateFlow<String?>(null)
     val errorMessage: StateFlow<String?> = _errorMessage.asStateFlow()
 
-    // Expose all Scan History logs from Room database reactively
+    // Pagination limit for scan history
+    private val _historyLimit = MutableStateFlow(10)
+    val historyLimit: StateFlow<Int> = _historyLimit.asStateFlow()
+
+    // Expose limited/paginated Scan History logs from Room database reactively
     val historyList: StateFlow<List<ScanHistoryEntity>> = repository.allHistory
+        .combine(_historyLimit) { list, limit ->
+            list.take(limit)
+        }
         .stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(5000),
             initialValue = emptyList()
         )
+
+    fun loadMoreHistory() {
+        _historyLimit.value += 10
+    }
+
+    fun resetHistoryLimit() {
+        _historyLimit.value = 10
+    }
 
     init {
         // Collect scan results and append them to the real-time list
