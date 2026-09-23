@@ -1,0 +1,6 @@
+{
+  "name": "Range Scanner",
+  "description": "Network administration and security research utility with concurrent HTTP scanning and AI audio transcription.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
