@@ -26,7 +26,7 @@ class ScanEngine(private val context: Context) {
     private val tag = "ScanEngine"
 
     // Configuration limits
-    var maxTargetLimit: Int = 65536
+    var maxTargetLimit: Int = 131072
     var defaultConcurrency: Int = 12
     var requestTimeoutSeconds: Long = 4
 
@@ -132,7 +132,15 @@ class ScanEngine(private val context: Context) {
         val network = baseIpLong and mask
         val broadcast = network or (mask.inv() and 0xFFFFFFFFL)
 
-        val totalHosts = broadcast - network + 1
+        val totalHosts = when {
+            prefix == 32 -> 1L
+            prefix == 31 -> 2L
+            else -> broadcast - network - 1
+        }
+
+        if (totalHosts > maxTargetLimit) {
+            throw IllegalArgumentException("This range contains too many targets ($totalHosts). Max allowed is $maxTargetLimit.")
+        }
 
         val list = mutableListOf<String>()
         when {
@@ -269,10 +277,9 @@ class ScanEngine(private val context: Context) {
             val startTime = Date()
             val df = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
 
-            var completedCount = 0
-            var liveHostsCount = 0
+            val completedCounter = java.util.concurrent.atomic.AtomicInteger(0)
+            val liveHostsCounter = java.util.concurrent.atomic.AtomicInteger(0)
 
-            val semaphore = Semaphore(if (concurrency > 0) concurrency else defaultConcurrency)
             val baseClient = if (allowInsecureSsl) insecureClient ?: secureClient!! else secureClient!!
             
             // Build specialized dynamic client with custom timeout choice
@@ -282,69 +289,92 @@ class ScanEngine(private val context: Context) {
                 .writeTimeout(timeoutMs, TimeUnit.MILLISECONDS)
                 .build()
 
-            // Start scanning target list concurrently
-            val jobs = mutableListOf<Job>()
+            val workerCount = if (concurrency > 0) concurrency else defaultConcurrency
 
-            coroutineScope {
+            // Represent scanning target
+            data class ScanTarget(val ip: String, val port: Int, val protocol: String)
+
+            // Define targets sequence evaluated lazily
+            val targetsSequence = sequence {
                 for (ip in ips) {
-                    if (isStopped) break
                     for (port in ports) {
-                        if (isStopped) break
-
-                        // HTTP Target
-                        jobs.add(launch {
-                            if (isStopped) return@launch
-                            semaphore.acquire()
-                            try {
-                                if (isStopped) return@launch
-                                val result = checkTarget(client, ip, port, "http")
-                                completedCount++
-
-                                val wasLive = handleResult(scanDir, result)
-                                if (wasLive) {
-                                    liveHostsCount++
-                                }
-
-                                withContext(Dispatchers.Main) {
-                                    onStateChanged(ScanState.Running(completedCount, totalTargets, liveHostsCount))
-                                }
-                            } finally {
-                                semaphore.release()
-                            }
-                        })
-
-                        // HTTPS Target
-                        jobs.add(launch {
-                            if (isStopped) return@launch
-                            semaphore.acquire()
-                            try {
-                                if (isStopped) return@launch
-                                val result = checkTarget(client, ip, port, "https")
-                                completedCount++
-
-                                val wasLive = handleResult(scanDir, result)
-                                if (wasLive) {
-                                    liveHostsCount++
-                                }
-
-                                withContext(Dispatchers.Main) {
-                                    onStateChanged(ScanState.Running(completedCount, totalTargets, liveHostsCount))
-                                }
-                            } finally {
-                                semaphore.release()
-                            }
-                        })
+                        yield(ScanTarget(ip, port, "http"))
+                        yield(ScanTarget(ip, port, "https"))
                     }
                 }
+            }
 
-                // Wait for all active checks to finish or cancel if stopped
-                jobs.joinAll()
+            // Create a channel for workers to consume from
+            val targetChannel = kotlinx.coroutines.channels.Channel<ScanTarget>(capacity = workerCount)
+
+            // Dynamic progress throttle to prevent flooding UI / main thread
+            var lastProgressUpdateTime = 0L
+            suspend fun notifyProgress(force: Boolean = false) {
+                val now = System.currentTimeMillis()
+                if (force || now - lastProgressUpdateTime >= 250L) {
+                    lastProgressUpdateTime = now
+                    val comp = completedCounter.get()
+                    val live = liveHostsCounter.get()
+                    withContext(Dispatchers.Main) {
+                        onStateChanged(ScanState.Running(comp, totalTargets, live))
+                    }
+                }
+            }
+
+            // Launch producer to stream targets lazily into the channel
+            val producerJob = launch(Dispatchers.Default) {
+                try {
+                    for (target in targetsSequence) {
+                        if (isStopped || !isActive) break
+                        targetChannel.send(target)
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } finally {
+                    targetChannel.close()
+                }
+            }
+
+            // Launch exactly workerCount worker coroutines
+            val workers = List(workerCount) {
+                launch(Dispatchers.IO) {
+                    try {
+                        for (target in targetChannel) {
+                            if (isStopped || !isActive) break
+                            val result = checkTarget(client, target.ip, target.port, target.protocol)
+                            completedCounter.incrementAndGet()
+
+                            val wasLive = handleResult(scanDir, result)
+                            if (wasLive) {
+                                liveHostsCounter.incrementAndGet()
+                            }
+
+                            notifyProgress(force = false)
+                        }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Log.e(tag, "Error in scan worker", e)
+                    }
+                }
+            }
+
+            // Wait for workers and producer to finish
+            try {
+                producerJob.join()
+                workers.joinAll()
+            } catch (e: CancellationException) {
+                isStopped = true
+                throw e
             }
 
             val endTime = Date()
             val durationMs = endTime.time - startTime.time
 
-            // Write final scan log asynchronously to prevent UI freeze or blocking on completion
+            // Post absolute final progress
+            notifyProgress(force = true)
+
+            // Write final scan log summary asynchronously to prevent UI freeze or blocking on completion
             CoroutineScope(Dispatchers.IO).launch {
                 writeScanLog(
                     scanDir = scanDir,
@@ -355,17 +385,17 @@ class ScanEngine(private val context: Context) {
                     endTimeStr = df.format(endTime),
                     durationMs = durationMs,
                     totalTargets = totalTargets,
-                    completedTargets = completedCount,
-                    liveHosts = liveHostsCount,
+                    completedTargets = completedCounter.get(),
+                    liveHosts = liveHostsCounter.get(),
                     stopped = isStopped
                 )
             }
 
             withContext(Dispatchers.Main) {
                 if (isStopped) {
-                    onStateChanged(ScanState.Stopped(completedCount, totalTargets, liveHostsCount))
+                    onStateChanged(ScanState.Stopped(completedCounter.get(), totalTargets, liveHostsCounter.get()))
                 } else {
-                    onStateChanged(ScanState.Completed(totalTargets, liveHostsCount, durationMs))
+                    onStateChanged(ScanState.Completed(totalTargets, liveHostsCounter.get(), durationMs))
                 }
             }
         }

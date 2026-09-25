@@ -73,11 +73,39 @@ class ScanViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     init {
-        // Collect scan results and append them to the real-time list
+        val resultBuffer = java.util.concurrent.ConcurrentLinkedQueue<ScanResult>()
+        
+        // Collect scan results and append them to a thread-safe concurrent buffer
         viewModelScope.launch {
             scanEngine.resultFlow.collect { result ->
-                // Ensure UI operations are lightweight
-                scanResults.add(0, result) // Add new results at the top
+                resultBuffer.offer(result)
+            }
+        }
+
+        // Periodically batch-add buffered results to the Compose state list on the Main thread
+        viewModelScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(200) // update UI 5 times a second max
+                if (resultBuffer.isNotEmpty()) {
+                    val temp = mutableListOf<ScanResult>()
+                    while (true) {
+                        val item = resultBuffer.poll() ?: break
+                        temp.add(item)
+                    }
+                    if (temp.isNotEmpty()) {
+                        // Add new results at the top (index 0) in a single batch operation
+                        scanResults.addAll(0, temp)
+                        // Limit results to 1000 elements to avoid OOM or list rendering degradation
+                        if (scanResults.size > 1000) {
+                            val itemsToRemove = scanResults.size - 1000
+                            repeat(itemsToRemove) {
+                                if (scanResults.isNotEmpty()) {
+                                    scanResults.removeAt(scanResults.lastIndex)
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
